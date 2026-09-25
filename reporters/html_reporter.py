@@ -1,0 +1,175 @@
+"""GANDIV HTML Reporter - interactive, styled, searchable findings dashboard."""
+from __future__ import annotations
+
+import html
+import json
+from pathlib import Path
+
+from gandiv.models import ScanResult
+
+TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GANDIV Report — {target}</title>
+<style>
+  :root {{
+    --bg: #0b0f14; --panel: #121820; --border: #22303c; --text: #e6edf3; --muted: #8b9bab;
+    --crit: #ff4d4f; --high: #ff9f43; --med: #ffd93d; --low: #4dabf7; --info: #6c7a89;
+    --accent: #22c1c3;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: linear-gradient(160deg, #0b0f14 0%, #10151d 100%); color: var(--text);
+    padding: 24px; padding-top: max(24px, env(safe-area-inset-top));
+  }}
+  h1 {{ font-size: 1.6rem; margin-bottom: 4px; }}
+  .sub {{ color: var(--muted); margin-bottom: 24px; font-size: 0.9rem; }}
+  .stats {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }}
+  .stat-card {{
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; min-width: 120px;
+  }}
+  .stat-card .num {{ font-size: 1.6rem; font-weight: 700; }}
+  .stat-card .label {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em; }}
+  .risk-critical {{ color: var(--crit); }} .risk-high {{ color: var(--high); }}
+  .risk-medium {{ color: var(--med); }} .risk-low {{ color: var(--low); }} .risk-info {{ color: var(--info); }}
+  input#search {{
+    width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); margin-bottom: 18px; font-size: 0.95rem;
+  }}
+  .filters {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }}
+  .filters button {{
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 12px; border-radius: 20px; cursor: pointer; font-size: 0.82rem;
+  }}
+  .filters button.active {{ background: var(--accent); color: #04262a; border-color: var(--accent); font-weight: 600; }}
+  table {{ width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 10px; overflow: hidden; }}
+  th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 0.85rem; }}
+  th {{ color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: .04em; }}
+  tr:hover {{ background: rgba(255,255,255,0.03); }}
+  .badge {{
+    display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 600;
+  }}
+  .badge-critical {{ background: rgba(255,77,79,0.15); color: var(--crit); }}
+  .badge-high {{ background: rgba(255,159,67,0.15); color: var(--high); }}
+  .badge-medium {{ background: rgba(255,217,61,0.15); color: var(--med); }}
+  .badge-low {{ background: rgba(77,171,247,0.15); color: var(--low); }}
+  .badge-info {{ background: rgba(108,122,137,0.15); color: var(--info); }}
+  .value-cell {{ max-width: 420px; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }}
+  .table-wrap {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }}
+  footer {{ margin-top: 28px; color: var(--muted); font-size: 0.78rem; text-align: center; }}
+</style>
+</head>
+<body>
+  <h1>🛡️ GANDIV Reconnaissance Report</h1>
+  <div class="sub">Target: <strong>{target}</strong> · Type: {target_type} · Scan ID: {scan_id} · {started} → {finished}</div>
+
+  <div class="stats">
+    <div class="stat-card"><div class="num">{total}</div><div class="label">Total Findings</div></div>
+    <div class="stat-card"><div class="num risk-critical">{n_critical}</div><div class="label">Critical</div></div>
+    <div class="stat-card"><div class="num risk-high">{n_high}</div><div class="label">High</div></div>
+    <div class="stat-card"><div class="num risk-medium">{n_medium}</div><div class="label">Medium</div></div>
+    <div class="stat-card"><div class="num">{modules_ok}/{modules_total}</div><div class="label">Modules OK</div></div>
+  </div>
+
+  <input id="search" type="text" placeholder="Search findings by value, type, or source...">
+  <div class="filters" id="riskFilters">
+    <button class="active" data-risk="all">All</button>
+    <button data-risk="critical">Critical</button>
+    <button data-risk="high">High</button>
+    <button data-risk="medium">Medium</button>
+    <button data-risk="low">Low</button>
+    <button data-risk="info">Info</button>
+  </div>
+
+  <div class="table-wrap">
+    <table id="findingsTable">
+      <thead>
+        <tr><th>Type</th><th>Value</th><th>Confidence</th><th>Risk</th><th>Source(s)</th><th>Score</th></tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Generated by GANDIV · Authorized reconnaissance only · {finding_count} findings rendered</footer>
+
+<script>
+  const search = document.getElementById('search');
+  const rows = Array.from(document.querySelectorAll('#findingsTable tbody tr'));
+  let activeRisk = 'all';
+
+  function applyFilters() {{
+    const q = search.value.toLowerCase();
+    rows.forEach(r => {{
+      const text = r.dataset.search;
+      const risk = r.dataset.risk;
+      const matchesText = !q || text.includes(q);
+      const matchesRisk = activeRisk === 'all' || risk === activeRisk;
+      r.style.display = (matchesText && matchesRisk) ? '' : 'none';
+    }});
+  }}
+
+  search.addEventListener('input', applyFilters);
+  document.querySelectorAll('#riskFilters button').forEach(btn => {{
+    btn.addEventListener('click', () => {{
+      document.querySelectorAll('#riskFilters button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeRisk = btn.dataset.risk;
+      applyFilters();
+    }});
+  }});
+</script>
+</body>
+</html>
+"""
+
+ROW_TEMPLATE = """<tr data-risk="{risk}" data-search="{search_blob}">
+  <td>{type}</td>
+  <td class="value-cell">{value}</td>
+  <td><span class="badge badge-{confidence}">{confidence}</span></td>
+  <td><span class="badge badge-{risk}">{risk}</span></td>
+  <td>{source}</td>
+  <td>{score:.2f}</td>
+</tr>"""
+
+
+def generate(scan_result: ScanResult, output_path: Path) -> Path:
+    scan_result.compute_stats()
+    stats = scan_result.stats
+    by_risk = stats.get("by_risk", {})
+
+    rows_html = []
+    for f in scan_result.findings:
+        value = html.escape(f.value)[:300]
+        ftype = html.escape(f.type.replace("_", " ").title())
+        source = html.escape(", ".join(f.corroborated_by) if f.corroborated_by else f.source)
+        search_blob = html.escape(f"{f.type} {f.value} {f.source}".lower())
+        rows_html.append(ROW_TEMPLATE.format(
+            risk=f.risk.value, confidence=f.confidence.value, type=ftype, value=value,
+            source=source, score=f.score, search_blob=search_blob,
+        ))
+
+    page = TEMPLATE.format(
+        target=html.escape(scan_result.target.normalized),
+        target_type=scan_result.target.type.value,
+        scan_id=scan_result.scan_id,
+        started=scan_result.started_at,
+        finished=scan_result.finished_at or "in progress",
+        total=stats.get("total_findings", 0),
+        n_critical=by_risk.get("critical", 0),
+        n_high=by_risk.get("high", 0),
+        n_medium=by_risk.get("medium", 0),
+        modules_ok=stats.get("modules_succeeded", 0),
+        modules_total=stats.get("modules_run", 0),
+        rows="\n".join(rows_html),
+        finding_count=len(scan_result.findings),
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(page, encoding="utf-8")
+    return output_path
