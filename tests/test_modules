@@ -1,0 +1,251 @@
+"""
+GANDIV Test Suite
+Unit tests for validators, models, normalizer, and reporters.
+Network-dependent module functions are tested with monkeypatched HTTP calls
+where practical; pure logic (scoring, dedup, detection) is tested directly.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from gandiv.models import Confidence, Finding, ModuleResult, RiskLevel, ScanResult, Target, TargetType
+from gandiv.normalizer import is_false_positive, normalize
+from gandiv.utils.validators import (
+    detect_target_type, extract_name_parts, is_valid_domain, is_valid_email,
+    is_valid_ip, is_valid_ipv4, is_valid_username, is_valid_url, is_subdomain_of,
+    normalize_domain, sanitize_filename,
+)
+from gandiv.config import EMAIL_PATTERNS
+from gandiv.modules.email_recon import generate_email_candidates
+from gandiv.modules.osint_aggregator import generate_google_dorks, generate_github_dorks, cross_reference
+
+
+# ---------- Validators ----------
+
+class TestDomainValidation:
+    def test_valid_domains(self):
+        assert is_valid_domain("example.com")
+        assert is_valid_domain("sub.example.co.uk")
+        assert is_valid_domain("a-b.example.com")
+
+    def test_invalid_domains(self):
+        assert not is_valid_domain("")
+        assert not is_valid_domain("not a domain")
+        assert not is_valid_domain("-example.com")
+        assert not is_valid_domain("example")
+
+    def test_normalize_domain_strips_scheme_and_www(self):
+        assert normalize_domain("https://www.example.com/path") == "example.com"
+        assert normalize_domain("HTTP://Example.COM:8080") == "example.com"
+
+
+class TestEmailValidation:
+    def test_valid_emails(self):
+        assert is_valid_email("user@example.com")
+        assert is_valid_email("first.last+tag@sub.example.co")
+
+    def test_invalid_emails(self):
+        assert not is_valid_email("not-an-email")
+        assert not is_valid_email("@example.com")
+        assert not is_valid_email("user@")
+
+
+class TestIPValidation:
+    def test_valid_ipv4(self):
+        assert is_valid_ipv4("192.168.1.1")
+        assert is_valid_ipv4("8.8.8.8")
+
+    def test_invalid_ipv4(self):
+        assert not is_valid_ipv4("999.999.999.999")
+        assert not is_valid_ipv4("not.an.ip.addr")
+
+    def test_ipv6(self):
+        assert is_valid_ip("2001:db8::1")
+
+
+class TestUsernameAndURL:
+    def test_valid_usernames(self):
+        assert is_valid_username("johndoe")
+        assert is_valid_username("j.doe_99")
+
+    def test_valid_urls(self):
+        assert is_valid_url("https://example.com/path")
+        assert not is_valid_url("example.com")  # missing scheme
+
+
+class TestTargetDetection:
+    def test_detects_domain(self):
+        assert detect_target_type("example.com") == TargetType.DOMAIN
+
+    def test_detects_email(self):
+        assert detect_target_type("user@example.com") == TargetType.EMAIL
+
+    def test_detects_ip(self):
+        assert detect_target_type("8.8.8.8") == TargetType.IP
+
+    def test_detects_url(self):
+        assert detect_target_type("https://example.com") == TargetType.URL
+
+    def test_detects_username(self):
+        assert detect_target_type("johndoe123") == TargetType.USERNAME
+
+    def test_detects_org(self):
+        assert detect_target_type("Acme Corp Inc") == TargetType.ORG
+
+    def test_detects_person(self):
+        assert detect_target_type("John Smith") == TargetType.PERSON
+
+
+class TestSubdomainCheck:
+    def test_is_subdomain_of(self):
+        assert is_subdomain_of("mail.example.com", "example.com")
+        assert is_subdomain_of("example.com", "example.com")
+        assert not is_subdomain_of("example.com", "other.com")
+        assert not is_subdomain_of("notexample.com", "example.com")
+
+
+class TestSanitizeFilename:
+    def test_sanitize(self):
+        assert sanitize_filename("Acme Corp/Inc") == "Acme_Corp_Inc"
+        assert sanitize_filename("") == "target"
+
+
+# ---------- Email pattern generation ----------
+
+class TestEmailPatternGeneration:
+    def test_extract_name_parts(self):
+        parts = extract_name_parts("John Smith")
+        assert parts == {"first": "john", "last": "smith", "f": "j", "l": "s"}
+
+    def test_extract_name_parts_single_word_returns_none(self):
+        assert extract_name_parts("Madonna") is None
+
+    def test_generate_email_candidates(self):
+        candidates = generate_email_candidates("John Smith", "example.com")
+        assert "john.smith@example.com" in candidates
+        assert "jsmith@example.com" in candidates
+        assert len(candidates) == len(set(candidates))  # no duplicates
+
+    def test_generate_email_candidates_no_name(self):
+        assert generate_email_candidates("Madonna", "example.com") == []
+
+    def test_all_patterns_are_formattable(self):
+        parts = extract_name_parts("Jane Doe")
+        parts["domain"] = "example.com"
+        for pattern in EMAIL_PATTERNS:
+            assert pattern.format(**parts)  # should not raise
+
+
+# ---------- Models ----------
+
+class TestFinding:
+    def test_dedup_key_case_insensitive(self):
+        f1 = Finding(type="subdomain", value="MAIL.example.com", source="crt.sh", module="domain_recon")
+        f2 = Finding(type="subdomain", value="mail.example.com", source="hackertarget", module="domain_recon")
+        assert f1.dedup_key() == f2.dedup_key()
+
+    def test_to_dict_serializes_enums_as_strings(self):
+        f = Finding(type="x", value="y", source="s", module="m",
+                     confidence=Confidence.HIGH, risk=RiskLevel.CRITICAL)
+        d = f.to_dict()
+        assert d["confidence"] == "high"
+        assert d["risk"] == "critical"
+
+
+class TestScanResultStats:
+    def test_compute_stats(self):
+        target = Target(raw="example.com", type=TargetType.DOMAIN, normalized="example.com")
+        scan = ScanResult(target=target)
+        scan.findings = [
+            Finding(type="subdomain", value="a.example.com", source="crt.sh", module="domain_recon",
+                    confidence=Confidence.HIGH, risk=RiskLevel.INFO),
+            Finding(type="open_port", value="1.2.3.4:22", source="shodan", module="infra_recon",
+                    confidence=Confidence.HIGH, risk=RiskLevel.MEDIUM),
+        ]
+        scan.module_results = [
+            ModuleResult(module_name="domain_recon", success=True),
+            ModuleResult(module_name="infra_recon", success=False, error="timeout"),
+        ]
+        scan.compute_stats()
+        assert scan.stats["total_findings"] == 2
+        assert scan.stats["modules_succeeded"] == 1
+        assert scan.stats["modules_failed"] == 1
+        assert scan.stats["by_risk"]["medium"] == 1
+
+
+# ---------- Normalizer ----------
+
+class TestNormalizer:
+    def test_deduplicates_same_value_across_sources(self):
+        findings = [
+            Finding(type="subdomain", value="mail.example.com", source="crt.sh", module="domain_recon", score=0.95),
+            Finding(type="subdomain", value="mail.example.com", source="hackertarget", module="domain_recon", score=0.75),
+        ]
+        result = normalize(findings)
+        assert len(result) == 1
+        assert set(result[0].corroborated_by) == {"crt.sh", "hackertarget"}
+        assert result[0].confidence == Confidence.HIGH  # corroboration bonus pushes it up
+
+    def test_filters_false_positives(self):
+        findings = [
+            Finding(type="domain", value="example.com", source="whois", module="domain_recon"),
+            Finding(type="domain", value="realtarget.com", source="whois", module="domain_recon"),
+        ]
+        result = normalize(findings)
+        values = {f.value for f in result}
+        assert "example.com" not in values
+        assert "realtarget.com" in values
+
+    def test_is_false_positive_patterns(self):
+        assert is_false_positive(Finding(type="x", value="***", source="s", module="m"))
+        assert is_false_positive(Finding(type="x", value="xxxxx", source="s", module="m"))
+        assert not is_false_positive(Finding(type="x", value="realvalue.com", source="s", module="m"))
+
+    def test_highest_risk_wins_on_merge(self):
+        findings = [
+            Finding(type="path", value="/admin", source="a", module="web_recon", risk=RiskLevel.LOW),
+            Finding(type="path", value="/admin", source="b", module="web_recon", risk=RiskLevel.CRITICAL),
+        ]
+        result = normalize(findings)
+        assert result[0].risk == RiskLevel.CRITICAL
+
+    def test_sorted_by_risk_then_score(self):
+        findings = [
+            Finding(type="a", value="v1", source="s", module="m", risk=RiskLevel.LOW, score=0.9),
+            Finding(type="b", value="v2", source="s", module="m", risk=RiskLevel.CRITICAL, score=0.5),
+        ]
+        result = normalize(findings)
+        assert result[0].risk == RiskLevel.CRITICAL  # critical sorts first regardless of score
+
+
+# ---------- OSINT aggregator ----------
+
+class TestDorkGeneration:
+    def test_google_dorks_contain_target(self):
+        dorks = generate_google_dorks("example.com")
+        assert all("example.com" in d for d in dorks)
+        assert len(dorks) > 0
+
+    def test_github_dorks_contain_target(self):
+        dorks = generate_github_dorks("example.com")
+        assert all("example.com" in d for d in dorks)
+
+    def test_cross_reference_requires_multiple_sources(self):
+        findings = [
+            Finding(type="subdomain", value="a.example.com", source="crt.sh", module="domain_recon", score=0.9),
+            Finding(type="subdomain", value="a.example.com", source="hackertarget", module="domain_recon", score=0.7),
+            Finding(type="subdomain", value="b.example.com", source="crt.sh", module="domain_recon", score=0.9),
+        ]
+        corroborated = cross_reference(findings)
+        assert len(corroborated) == 1
+        assert corroborated[0].value == "a.example.com"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
